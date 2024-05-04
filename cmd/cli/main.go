@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/neteng-tools/snmpCLI/snmpScan"
+	"github.com/neteng-tools/snmpScan/pkg/Scanner"
 )
 
 func main() {

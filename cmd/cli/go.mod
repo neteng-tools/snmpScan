@@ -2,9 +2,9 @@ module snmpCLI
 
 go 1.21.5
 
-require "github.com/neteng-tools/snmpCLI/snmpScan" v0.0.0
+require "github.com/neteng-tools/snmpScan/pkg/Scanner" v0.0.0
 
-replace "github.com/neteng-tools/snmpCLI/snmpScan" => "../snmpScan"
+replace "github.com/neteng-tools/snmpScan/pkg/Scanner" => "../../pkg/Scanner"
 
 require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
