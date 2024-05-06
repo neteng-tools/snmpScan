@@ -214,21 +214,9 @@ func (input *SnmpInput) Scanner(target string) {
 		for _, variable := range result.Variables {
 			if variable.Value != nil {
 				value, ok := input.getValue(variable.Value)
-				if ok 
-				switch v := variable.Value.(type) {
-				case string:
-					rows = append(rows, variable.Value.(string))
-				case []uint8:
-					decodedString, err := hex.DecodeString(string(v))
-					if err != nil {
-						rows = append(rows, string(v))
-					} else {
-						fmt.Println(hex.EncodeToString(decodedString))
-					}
-				case int:
-					rows = append(rows, fmt.Sprint(v))
-				default:
-					fmt.Println(v)
+				if ok {
+					rows = append(rows, value)
+				} else {
 					rows = append(rows, "Unhandled SNMP output")
 				}
 			}
