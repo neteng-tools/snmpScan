@@ -15,11 +15,6 @@ import (
 	g "github.com/gosnmp/gosnmp"
 )
 
-const (
-	defaultOID     = "1.3.6.1.2.1.1.5.0"
-	defaultWalkOID = "1.3.6"
-)
-
 type SnmpInput struct {
 	Username string
 	Priv     string
@@ -35,6 +30,11 @@ type SnmpInput struct {
 	PrivMap  map[string]g.SnmpV3PrivProtocol
 	AuthMap  map[string]g.SnmpV3AuthProtocol
 }
+
+const (
+	defaultOID     = "1.3.6.1.2.1.1.5.0"
+	defaultWalkOID = "1.3.6"
+)
 
 func (input *SnmpInput) Fill_Defaults() {
 	input.Oid = defaultOID
@@ -61,42 +61,52 @@ func (input *SnmpInput) StartScan(ip string) error {
 	count := 0
 	var waitGroup sync.WaitGroup
 	ipList := strings.Split(ip, ",")
-
 	for _, ipGate := range ipList {
 		netID := strings.Split(ipGate, ".")
+		//simple check that this is an IP. If split on the dot we should always have 4 octets 10.0.0.1-150 > [10 0 0 1-150]
 		if len(netID) < 3 {
 			return fmt.Errorf("provided IP Address is incorrect or malformed. Please retry")
 		}
 		netRangeSlice := strings.Split(netID[3], "-")
-		var netRangeEnd int
-		netRangeStart, err := strconv.Atoi(netRangeSlice[0])
-		if err != nil {
-			return fmt.Errorf("starting IP not valid: %v", err)
-		}
-		if len(netRangeSlice) == 1 {
-			netRangeEnd, err = strconv.Atoi(netRangeSlice[0])
-			if err != nil {
-				return fmt.Errorf("ending IP not valid: %v", err)
+		if input.Method == "Walk" {
+			//makes sure we're not using an ip range. 1-150 > len([1 150]) > 1
+			if len(netRangeSlice) == 1 {
+				//if we're a good IP and don't have a range on the end, pass the original IP.
+				input.Scanner(ipGate)
+			} else {
+				return fmt.Errorf("too many IPs provided for a Walk. Please retry with a single IP")
 			}
 		} else {
-			netRangeEnd = netRangeStart
-		}
-
-		for i := netRangeStart; i <= netRangeEnd; i++ {
-			ipAddr := netID[0] + "." + netID[1] + "." + netID[2] + "." + strconv.Itoa(i)
-			waitGroup.Add(1)
-			go func() {
-				defer waitGroup.Done()
-				input.Scanner(ipAddr)
-			}()
-			if count > 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
-				time.Sleep(time.Duration(500 * time.Millisecond))
-				count = 0
+			var netRangeEnd int
+			netRangeStart, err := strconv.Atoi(netRangeSlice[0])
+			if err != nil {
+				return fmt.Errorf("starting IP not valid: %v", err)
 			}
-			count++
+			if len(netRangeSlice) == 2 {
+				netRangeEnd, err = strconv.Atoi(netRangeSlice[1])
+				if err != nil {
+					return fmt.Errorf("ending IP not valid: %v", err)
+				}
+			} else {
+				netRangeEnd = netRangeStart
+			}
+
+			for i := netRangeStart; i <= netRangeEnd; i++ {
+				ipAddr := netID[0] + "." + netID[1] + "." + netID[2] + "." + strconv.Itoa(i)
+				waitGroup.Add(1)
+				go func() {
+					defer waitGroup.Done()
+					input.Scanner(ipAddr)
+				}()
+				if count > 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
+					time.Sleep(time.Duration(500 * time.Millisecond))
+					count = 0
+				}
+				count++
+			}
+			waitGroup.Wait()
 		}
 	}
-	waitGroup.Wait()
 	return nil
 }
 
@@ -203,6 +213,8 @@ func (input *SnmpInput) Scanner(target string) {
 		var rows []string
 		for _, variable := range result.Variables {
 			if variable.Value != nil {
+				value, ok := input.getValue(variable.Value)
+				if ok 
 				switch v := variable.Value.(type) {
 				case string:
 					rows = append(rows, variable.Value.(string))
@@ -231,6 +243,33 @@ func (input *SnmpInput) Scanner(target string) {
 		}
 	}
 
+}
+
+//processes oid return value and tries to convert it to a string. Bool is set to false if we couldn't determine the type.
+func (input *SnmpInput) getValue(value any) (string, bool) {
+	switch v := value.(type) {
+	case []byte:
+		decodedString := hex.EncodeToString(v)
+		var macString string
+		if len(decodedString) == 12 {
+			for i := 0; i < len(decodedString); i++ {
+				if i%2 == 0 && i != 0 {
+					macString += ":"
+				}
+				macString += strings.ToUpper(string(decodedString[i]))
+
+			}
+			return macString, true
+		} else {
+			return string(v), true
+		}
+	case string:
+		return v, true
+	case uint, uint16, uint64, uint32, int:
+		return fmt.Sprint(v), true
+	default:
+		return fmt.Sprintf("*%v %v", v, reflect.TypeOf(v).Name()), false
+	}
 }
 
 // Uses the predetermined version information to finish building the snmp config.

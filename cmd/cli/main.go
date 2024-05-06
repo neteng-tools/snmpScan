@@ -14,7 +14,7 @@ func main() {
 	snmp.Fill_Defaults()
 
 	ipAddExp := flag.String("t", "", "Define target devices. (-t 10.0.0.1 or -t 10.0.0.1-100 or -t 10.0.0.1,10.0.0.2)")
-	snmp.Method = *flag.String("m", "Get", "Set snmp method.\n\t-m Get\n\t-m Walk.")
+	snmp.Method = *flag.String("m", "Get", "Set snmp method.\n\t-m Get\n\t-m Walk   A walk is limited to a single IP")
 	snmp.Version = *flag.String("v", "3", "Set snmp version.\n\t-v 1\n\t-v 2c\n\t-v 3")
 	snmp.PrivType = *flag.String("pt", "AES", "Enter SNMPv3 Priv Type.\n\t-pt AES\n\t-pt AES192\n\t-pt AES256")
 	snmp.AuthType = *flag.String("at", "SHA", "Enter SNMPv3 Auth Type.\n\t-at SHA\n\t-at SHA256\n\t-at SHA512")
@@ -26,6 +26,10 @@ func main() {
 	snmp.Priv = *flag.String("p", "", "Provide Privacy Password")
 
 	flag.Parse()
+	if *ipAddExp == "" {
+		flag.PrintDefaults()
+		os.Exit(0)
+	}
 	start := time.Now()
 	err := snmp.StartScan(*ipAddExp)
 	if err != nil {
