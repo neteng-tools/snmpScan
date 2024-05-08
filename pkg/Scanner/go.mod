@@ -1,6 +1,6 @@
 module github.com/neteng-tools/snmpScan/pkg/Scanner
 
-go 1.21.5
+go 1.22.2
 
 require (
 	github.com/go-ping/ping v1.1.0
@@ -8,8 +8,8 @@ require (
 )
 
 require (
-	github.com/google/uuid v1.2.0 // indirect
-	golang.org/x/net v0.15.0 // indirect
-	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c // indirect
-	golang.org/x/sys v0.13.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	golang.org/x/net v0.24.0 // indirect
+	golang.org/x/sync v0.7.0 // indirect
+	golang.org/x/sys v0.20.0 // indirect
 )

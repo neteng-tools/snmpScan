@@ -31,11 +31,19 @@ func main() {
 		os.Exit(0)
 	}
 	start := time.Now()
-	err := snmp.StartScan(*ipAddExp)
+	output := make(chan string, 0)
+	err := snmp.StartScan(*ipAddExp, output)
 	if err != nil {
 		log.Print(err)
 		os.Exit(2)
 	}
+	if len(rows) == 1 {
+			fmt.Println(rows[0])
+		} else {
+			m.Lock()
+			fmt.Printf("%s,[%v],[%s]\n", target, strings.Join(rows, ":::"), strings.Join(oids, ":::"))
+			m.Unlock()
+		}
 	duration := time.Since(start)
 	if snmp.Verbose {
 		log.Print(duration)

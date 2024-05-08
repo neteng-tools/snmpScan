@@ -31,6 +31,18 @@ type SnmpInput struct {
 	AuthMap  map[string]g.SnmpV3AuthProtocol
 }
 
+type snmpOutput struct{
+	IP string
+	Value map[string]string
+	Log string
+}
+
+type Response struct{
+	IP string
+	Value map[string]string
+}
+
+
 const (
 	defaultOID     = "1.3.6.1.2.1.1.5.0"
 	defaultWalkOID = "1.3.6"
@@ -57,7 +69,7 @@ func (input *SnmpInput) Fill_Defaults() {
 }
 
 // Processes input provided as 10.0.0.1 or 10.0.0.1-255 or 10.0.0.1,10.0.0.2
-func (input *SnmpInput) StartScan(ip string) error {
+func (input *SnmpInput) StartScan(ip string, output chan string) (Response, error) {
 	count := 0
 	var waitGroup sync.WaitGroup
 	ipList := strings.Split(ip, ",")
@@ -65,27 +77,27 @@ func (input *SnmpInput) StartScan(ip string) error {
 		netID := strings.Split(ipGate, ".")
 		//simple check that this is an IP. If split on the dot we should always have 4 octets 10.0.0.1-150 > [10 0 0 1-150]
 		if len(netID) < 3 {
-			return fmt.Errorf("provided IP Address is incorrect or malformed. Please retry")
+			return Response{}, fmt.Errorf("provided IP Address is incorrect or malformed. Please retry")
 		}
 		netRangeSlice := strings.Split(netID[3], "-")
 		if input.Method == "Walk" {
 			//makes sure we're not using an ip range. 1-150 > len([1 150]) > 1
 			if len(netRangeSlice) == 1 {
 				//if we're a good IP and don't have a range on the end, pass the original IP.
-				input.Scanner(ipGate)
+				return input.Scanner(ipGate, output)
 			} else {
-				return fmt.Errorf("too many IPs provided for a Walk. Please retry with a single IP")
+				return Response{}, fmt.Errorf("too many IPs provided for a Walk. Please retry with a single IP")
 			}
 		} else {
 			var netRangeEnd int
 			netRangeStart, err := strconv.Atoi(netRangeSlice[0])
 			if err != nil {
-				return fmt.Errorf("starting IP not valid: %v", err)
+				return Response{}, fmt.Errorf("starting IP not valid: %v", err)
 			}
 			if len(netRangeSlice) == 2 {
 				netRangeEnd, err = strconv.Atoi(netRangeSlice[1])
 				if err != nil {
-					return fmt.Errorf("ending IP not valid: %v", err)
+					return Response{}, fmt.Errorf("ending IP not valid: %v", err)
 				}
 			} else {
 				netRangeEnd = netRangeStart
@@ -94,10 +106,10 @@ func (input *SnmpInput) StartScan(ip string) error {
 			for i := netRangeStart; i <= netRangeEnd; i++ {
 				ipAddr := netID[0] + "." + netID[1] + "." + netID[2] + "." + strconv.Itoa(i)
 				waitGroup.Add(1)
-				go func() {
+				go func(host string, output chan string) {
 					defer waitGroup.Done()
-					input.Scanner(ipAddr)
-				}()
+					input.Scanner(host, output)
+				}(ipAddr, output)
 				if count > 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
 					time.Sleep(time.Duration(500 * time.Millisecond))
 					count = 0
@@ -110,13 +122,13 @@ func (input *SnmpInput) StartScan(ip string) error {
 	return nil
 }
 
-func (input *SnmpInput) Scanner(target string) {
-
+func (input *SnmpInput) Scanner(target string, output chan string) (Response, error) {
+	var resp Response
 	var m sync.Mutex
 	input.Config.Target = target
 	pinger, pingErr := ping.NewPinger(target)
 	if pingErr != nil {
-		fmt.Println("timed out: " + pingErr.Error())
+		return Response{}, fmt.Errorf("timed out: %v", pingErr.Error())
 	}
 	pinger.Count = 3
 	pinger.SetPrivileged(true)
@@ -125,19 +137,18 @@ func (input *SnmpInput) Scanner(target string) {
 	stats := pinger.Statistics()
 	// get send/receive/rtt stats
 	if stats.PacketsRecv == 0 {
-		return
+		return Response{}, fmt.Errorf("ping failed: device not online")
 	}
 
 	if input.Verbose {
-		fmt.Println("SNMP Version: " + input.Version)
+		output <- fmt.Sprintf("SNMP Version: %v", input.Version)
 	}
-
+	resp.IP = target
 	err := input.Config.Connect()
 	if err != nil {
 		m.Lock()
 		defer m.Unlock()
-		fmt.Println(target + ": error connecting " + err.Error())
-		return
+		return Response{}, fmt.Errorf("snmp failed: error connecting %v", err.Error())
 	}
 	input.FinishConfig()
 	if input.Verbose {
@@ -155,6 +166,10 @@ func (input *SnmpInput) Scanner(target string) {
 		var count int
 		var walkPayLoad bytes.Buffer
 		err := input.Config.Walk(input.Oid, func(pdu g.SnmpPDU) error {
+			value, ok := input.getValue(pdu.Value)
+			if ok {
+				resp.Value[input.Oid] = value
+			}
 			switch v := pdu.Value.(type) {
 			case []byte:
 				decodedString := hex.EncodeToString(v)
@@ -198,37 +213,30 @@ func (input *SnmpInput) Scanner(target string) {
 			return nil
 		})
 		if err != nil {
-			fmt.Println("Error walking device: " + err.Error())
-			return
+			return Response{}, fmt.Errorf("error walking device: %v", err.Error())
 		}
-		return
+		return resp, nil
 	}
 	if input.Method == "Get" {
 		oids := strings.Split(input.Oid, ",")
 		result, err := input.Config.Get(oids)
 		if err != nil {
 			//ignore devices that aren't needed.
-			return
+			return Response{}, nil
 		}
-		var rows []string
 		for _, variable := range result.Variables {
 			if variable.Value != nil {
 				value, ok := input.getValue(variable.Value)
 				if ok {
-					rows = append(rows, value)
+					resp.Value[input.Oid] = value
 				} else {
-					rows = append(rows, "Unhandled SNMP output")
+					resp.Value[input.Oid] = "Unhandled"
 				}
 			}
 
 		}
-		if len(rows) == 1 {
-			fmt.Println(rows[0])
-		} else {
-			m.Lock()
-			fmt.Printf("%s,[%v],[%s]\n", target, strings.Join(rows, ":::"), strings.Join(oids, ":::"))
-			m.Unlock()
-		}
+		return resp, nil
+		
 	}
 
 }
