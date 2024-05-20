@@ -1,10 +1,8 @@
 package snmpScan
 
 import (
-	"bytes"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"reflect"
 	"strconv"
 	"strings"
@@ -19,12 +17,12 @@ type SnmpInput struct {
 	Username string
 	Priv     string
 	Auth     string
-	Method   string
+	Method   *string
 	Version  string
 	AuthType string
 	PrivType string
 	Oid      string
-	Verbose  bool
+	Verbose  *bool
 	LineSize int
 	Config   g.GoSNMP
 	PrivMap  map[string]g.SnmpV3PrivProtocol
@@ -44,12 +42,22 @@ type Response struct{
 
 
 const (
-	defaultOID     = "1.3.6.1.2.1.1.5.0"
-	defaultWalkOID = "1.3.6"
+	defaultOID string     = "1.3.6.1.2.1.1.5.0"
+	defaultWalkOID string = "1.3.6"
 )
 
+
 func (input *SnmpInput) Fill_Defaults() {
+	input.Verbose = new(bool)
+	input.Method = new(string)
 	input.Oid = defaultOID
+	*input.Method = "Get"
+	input.Version = "3"
+	input.PrivType = "AES"
+	input.AuthType = "SHA"
+	*input.Verbose = false
+	input.LineSize = 50
+	input.Username = "public"
 	input.Config = g.GoSNMP{
 		Port:          161,
 		SecurityModel: g.UserSecurityModel,
@@ -69,176 +77,158 @@ func (input *SnmpInput) Fill_Defaults() {
 }
 
 // Processes input provided as 10.0.0.1 or 10.0.0.1-255 or 10.0.0.1,10.0.0.2
-func (input *SnmpInput) StartScan(ip string, output chan string) (Response, error) {
+func (input *SnmpInput) StartScan(ip string, respChan chan Response, info chan string, waitGroup *sync.WaitGroup) error {
 	count := 0
-	var waitGroup sync.WaitGroup
+	pingTimeout := 2000
+
 	ipList := strings.Split(ip, ",")
 	for _, ipGate := range ipList {
 		netID := strings.Split(ipGate, ".")
 		//simple check that this is an IP. If split on the dot we should always have 4 octets 10.0.0.1-150 > [10 0 0 1-150]
-		if len(netID) < 3 {
-			return Response{}, fmt.Errorf("provided IP Address is incorrect or malformed. Please retry")
+		if len(netID) <= 3 {
+			return fmt.Errorf("provided IP Address is incorrect or malformed. Please retry")
 		}
 		netRangeSlice := strings.Split(netID[3], "-")
-		if input.Method == "Walk" {
+		if *input.Method == "Walk" {
 			//makes sure we're not using an ip range. 1-150 > len([1 150]) > 1
 			if len(netRangeSlice) == 1 {
 				//if we're a good IP and don't have a range on the end, pass the original IP.
-				return input.Scanner(ipGate, output)
+				if input.isOnline(ipGate, pingTimeout){
+					return input.Scanner(ipGate, respChan, info)
+				}
 			} else {
-				return Response{}, fmt.Errorf("too many IPs provided for a Walk. Please retry with a single IP")
+				return fmt.Errorf("too many IPs provided for a Walk. Please retry with a single IP")
 			}
-		} else {
+		} else if *input.Method == "Get" {
 			var netRangeEnd int
 			netRangeStart, err := strconv.Atoi(netRangeSlice[0])
+				fmt.Println(netRangeSlice)
 			if err != nil {
-				return Response{}, fmt.Errorf("starting IP not valid: %v", err)
+				return  fmt.Errorf("starting IP not valid: %v", err)
 			}
 			if len(netRangeSlice) == 2 {
 				netRangeEnd, err = strconv.Atoi(netRangeSlice[1])
 				if err != nil {
-					return Response{}, fmt.Errorf("ending IP not valid: %v", err)
+					return  fmt.Errorf("ending IP not valid: %v", err)
 				}
 			} else {
 				netRangeEnd = netRangeStart
 			}
-
 			for i := netRangeStart; i <= netRangeEnd; i++ {
 				ipAddr := netID[0] + "." + netID[1] + "." + netID[2] + "." + strconv.Itoa(i)
 				waitGroup.Add(1)
-				go func(host string, output chan string) {
+				go func(ipAddress string, respChan chan Response, info chan string) {
 					defer waitGroup.Done()
-					input.Scanner(host, output)
-				}(ipAddr, output)
-				if count > 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
+					if input.isOnline(ipAddress, pingTimeout){
+						input.Scanner(ipAddress, respChan, info)
+					} else {
+						if *input.Verbose{
+							fmt.Printf("%v status is %v\n", ipAddress, input.isOnline(ipAddress, pingTimeout))
+						}
+					}
+				}(ipAddr, respChan, info)
+				if count >= 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
 					time.Sleep(time.Duration(500 * time.Millisecond))
 					count = 0
 				}
 				count++
 			}
-			waitGroup.Wait()
+			
+		} else {
+			return fmt.Errorf("method not defined")
 		}
 	}
 	return nil
 }
 
-func (input *SnmpInput) Scanner(target string, output chan string) (Response, error) {
-	var resp Response
-	var m sync.Mutex
-	input.Config.Target = target
+//pings the device and returns true if its online. If not it returns false even on error
+func (input *SnmpInput) isOnline(target string, timeout int) bool {
 	pinger, pingErr := ping.NewPinger(target)
 	if pingErr != nil {
-		return Response{}, fmt.Errorf("timed out: %v", pingErr.Error())
+		fmt.Println(pingErr.Error())
+		return false
 	}
 	pinger.Count = 3
 	pinger.SetPrivileged(true)
-	pinger.Timeout = 2000 * time.Millisecond
+	pinger.Timeout = time.Duration(timeout) * time.Millisecond
 	pinger.Run() // blocks until finished
 	stats := pinger.Statistics()
+	fmt.Print(stats.PacketsRecv)
 	// get send/receive/rtt stats
-	if stats.PacketsRecv == 0 {
-		return Response{}, fmt.Errorf("ping failed: device not online")
-	}
+	return stats.PacketsRecv > 0
+}
 
-	if input.Verbose {
-		output <- fmt.Sprintf("SNMP Version: %v", input.Version)
-	}
+func (input *SnmpInput) Scanner(target string, response chan Response, info chan string) error {
+	resp := new(Response)
+	resp.Value = make(map[string]string)
+	var m sync.Mutex
+	input.Config.Target = target
 	resp.IP = target
+
+	if *input.Verbose {
+		info <- fmt.Sprintf("SNMP Version: %v", *input.Method)
+	}
 	err := input.Config.Connect()
 	if err != nil {
 		m.Lock()
 		defer m.Unlock()
-		return Response{}, fmt.Errorf("snmp failed: error connecting %v", err.Error())
+		return fmt.Errorf("snmp failed: error connecting %v", err.Error())
 	}
 	input.FinishConfig()
-	if input.Verbose {
-		log.Println("connected to: " + target)
+	if *input.Verbose {
+		info <- fmt.Sprintf("connected to: %v", target)
 	}
 	defer input.Config.Conn.Close()
-	if input.Method == "Walk" {
+	if *input.Method == "Walk" {
 		//basically says to change default if not specified. This OID is currently the default for a Get request. Probably needs to be done better
 		if input.Oid == defaultOID {
 			input.Oid = defaultWalkOID
 		}
-		if input.Verbose {
-			log.Println("Walking devices from: " + input.Oid)
+		if *input.Verbose {
+			info <- fmt.Sprintf("Walking devices from: %v", input.Oid)
 		}
-		var count int
-		var walkPayLoad bytes.Buffer
 		err := input.Config.Walk(input.Oid, func(pdu g.SnmpPDU) error {
-			value, ok := input.getValue(pdu.Value)
-			if ok {
-				resp.Value[input.Oid] = value
-			}
-			switch v := pdu.Value.(type) {
-			case []byte:
-				decodedString := hex.EncodeToString(v)
-				var macString string
-				if len(decodedString) == 12 {
-					for i := 0; i < len(decodedString); i++ {
-						if i%2 == 0 && i != 0 {
-							macString += ":"
-						}
-						macString += strings.ToUpper(string(decodedString[i]))
-
-					}
-					walkPayLoad.WriteString(pdu.Name)
-					walkPayLoad.WriteString(": ")
-					walkPayLoad.WriteString(macString)
-					walkPayLoad.WriteString("\n")
-				} else {
-					walkPayLoad.WriteString(pdu.Name + ": " + string(v) + "\n")
+			go func(){
+				value, ok := input.getValue(pdu.Value)
+				if ok {
+					m.Lock()
+					defer m.Unlock()
+					resp.Value[input.Oid] = value
+					response <- *resp
 				}
-			case string:
-				walkPayLoad.WriteString(pdu.Name)
-				walkPayLoad.WriteString(": ")
-				walkPayLoad.WriteString(v)
-				walkPayLoad.WriteString("\n")
-			case uint, uint16, uint64, uint32, int:
-				walkPayLoad.WriteString(pdu.Name)
-				walkPayLoad.WriteString(": ")
-				walkPayLoad.WriteString(fmt.Sprint(v) + "\n")
-			default:
-				walkPayLoad.WriteString("*" + pdu.Name)
-				walkPayLoad.WriteString(": ")
-				walkPayLoad.WriteString(fmt.Sprint(v))
-				walkPayLoad.WriteString(reflect.TypeOf(v).Name() + "\n")
-			}
-			if count > input.LineSize {
-				fmt.Println(walkPayLoad.String())
-				count = 0
-				walkPayLoad.Reset()
-			}
-			count++
+			}()
 			return nil
 		})
 		if err != nil {
-			return Response{}, fmt.Errorf("error walking device: %v", err.Error())
+			return fmt.Errorf("error walking device: %v", err.Error())
 		}
-		return resp, nil
+		return nil
 	}
-	if input.Method == "Get" {
+	if *input.Method == "Get" {
 		oids := strings.Split(input.Oid, ",")
 		result, err := input.Config.Get(oids)
+		
 		if err != nil {
 			//ignore devices that aren't needed.
-			return Response{}, nil
+			return nil
 		}
 		for _, variable := range result.Variables {
 			if variable.Value != nil {
 				value, ok := input.getValue(variable.Value)
-				if ok {
+				if ok && value != "" {
+					if !*input.Verbose {
+						fmt.Println(value)
+					}
 					resp.Value[input.Oid] = value
-				} else {
-					resp.Value[input.Oid] = "Unhandled"
 				}
 			}
 
 		}
-		return resp, nil
+		response <- *resp
+		return nil
 		
 	}
-
+	return nil
 }
 
 //processes oid return value and tries to convert it to a string. Bool is set to false if we couldn't determine the type.
