@@ -17,52 +17,60 @@ type SnmpInput struct {
 	Username string
 	Priv     string
 	Auth     string
-	Method   *string
+	Method   string
 	Version  string
 	AuthType string
 	PrivType string
 	Oid      string
-	Verbose  *bool
+	Verbose  bool
 	LineSize int
 	Config   g.GoSNMP
 	PrivMap  map[string]g.SnmpV3PrivProtocol
 	AuthMap  map[string]g.SnmpV3AuthProtocol
 }
 
-type snmpOutput struct{
-	IP string
+type snmpOutput struct {
+	IP    string
 	Value map[string]string
-	Log string
+	Log   string
 }
 
-type Response struct{
-	IP string
+type Response struct {
+	IP    string
 	Value map[string]string
 }
-
 
 const (
-	defaultOID string     = "1.3.6.1.2.1.1.5.0"
-	defaultWalkOID string = "1.3.6"
+	defaultOID     string        = "1.3.6.1.2.1.1.5.0"
+	defaultWalkOID string        = "1.3.6"
+	Get            string        = "Get"
+	Walk           string        = "Walk"
+	v3             string        = "3"
+	v2c            string        = "2c"
+	v1             string        = "1"
+	AES            string        = "AES"
+	SHA            string        = "SHA"
+	snmpTimeout    time.Duration = 500 * time.Millisecond
+	maxThreads     time.Duration = 200 * time.Millisecond
+	pingTimeout    time.Duration = 2 * time.Second
+	pingRetries    int           = 3
 )
 
-
 func (input *SnmpInput) Fill_Defaults() {
-	input.Verbose = new(bool)
-	input.Method = new(string)
 	input.Oid = defaultOID
-	*input.Method = "Get"
-	input.Version = "3"
-	input.PrivType = "AES"
-	input.AuthType = "SHA"
-	*input.Verbose = false
+	input.Method = Get
+	input.Version = v3
+	input.PrivType = AES
+	input.AuthType = SHA
+	input.Verbose = false
 	input.LineSize = 50
 	input.Username = "public"
 	input.Config = g.GoSNMP{
 		Port:          161,
 		SecurityModel: g.UserSecurityModel,
 		MsgFlags:      g.AuthPriv,
-		Timeout:       1 * time.Second,
+		Timeout:       snmpTimeout,
+		Retries:       3,
 	}
 	input.PrivMap = map[string]g.SnmpV3PrivProtocol{
 		"AES":    g.AES,
@@ -77,10 +85,10 @@ func (input *SnmpInput) Fill_Defaults() {
 }
 
 // Processes input provided as 10.0.0.1 or 10.0.0.1-255 or 10.0.0.1,10.0.0.2
-func (input *SnmpInput) StartScan(ip string, respChan chan Response, info chan string, waitGroup *sync.WaitGroup) error {
+func (input *SnmpInput) StartScan(ip string, respChan chan Response, info chan string) error {
 	count := 0
-	pingTimeout := 2000
-
+	var waitGroup sync.WaitGroup
+	input.FinishConfig()
 	ipList := strings.Split(ip, ",")
 	for _, ipGate := range ipList {
 		netID := strings.Split(ipGate, ".")
@@ -89,27 +97,26 @@ func (input *SnmpInput) StartScan(ip string, respChan chan Response, info chan s
 			return fmt.Errorf("provided IP Address is incorrect or malformed. Please retry")
 		}
 		netRangeSlice := strings.Split(netID[3], "-")
-		if *input.Method == "Walk" {
+		if input.Method == Walk {
 			//makes sure we're not using an ip range. 1-150 > len([1 150]) > 1
 			if len(netRangeSlice) == 1 {
 				//if we're a good IP and don't have a range on the end, pass the original IP.
-				if input.isOnline(ipGate, pingTimeout){
-					return input.Scanner(ipGate, respChan, info)
+				if input.isOnline(ipGate) {
+					input.Scanner(ipGate, respChan, info)
 				}
 			} else {
 				return fmt.Errorf("too many IPs provided for a Walk. Please retry with a single IP")
 			}
-		} else if *input.Method == "Get" {
+		} else if input.Method == Get {
 			var netRangeEnd int
 			netRangeStart, err := strconv.Atoi(netRangeSlice[0])
-				fmt.Println(netRangeSlice)
 			if err != nil {
-				return  fmt.Errorf("starting IP not valid: %v", err)
+				return fmt.Errorf("starting IP not valid: %v", err)
 			}
 			if len(netRangeSlice) == 2 {
 				netRangeEnd, err = strconv.Atoi(netRangeSlice[1])
 				if err != nil {
-					return  fmt.Errorf("ending IP not valid: %v", err)
+					return fmt.Errorf("ending IP not valid: %v", err)
 				}
 			} else {
 				netRangeEnd = netRangeStart
@@ -119,76 +126,81 @@ func (input *SnmpInput) StartScan(ip string, respChan chan Response, info chan s
 				waitGroup.Add(1)
 				go func(ipAddress string, respChan chan Response, info chan string) {
 					defer waitGroup.Done()
-					if input.isOnline(ipAddress, pingTimeout){
+					if input.isOnline(ipAddress) {
 						input.Scanner(ipAddress, respChan, info)
 					} else {
-						if *input.Verbose{
-							fmt.Printf("%v status is %v\n", ipAddress, input.isOnline(ipAddress, pingTimeout))
+						if input.Verbose {
+							fmt.Printf("%v status is %v\n", ipAddress, input.isOnline(ipAddress))
 						}
 					}
 				}(ipAddr, respChan, info)
 				if count >= 200 { //only allows 200 routines at once. TODO: Needs replaced with real logic at some point to manage snmp connections.
-					time.Sleep(time.Duration(500 * time.Millisecond))
+					time.Sleep(maxThreads)
 					count = 0
 				}
 				count++
 			}
-			
+
 		} else {
 			return fmt.Errorf("method not defined")
 		}
 	}
+	waitGroup.Wait()
 	return nil
 }
 
-//pings the device and returns true if its online. If not it returns false even on error
-func (input *SnmpInput) isOnline(target string, timeout int) bool {
+// pings the device and returns true if its online. If not it returns false even on error
+func (input *SnmpInput) isOnline(target string) bool {
 	pinger, pingErr := ping.NewPinger(target)
 	if pingErr != nil {
 		fmt.Println(pingErr.Error())
 		return false
 	}
-	pinger.Count = 3
+	pinger.Count = pingRetries
 	pinger.SetPrivileged(true)
-	pinger.Timeout = time.Duration(timeout) * time.Millisecond
+	pinger.Timeout = pingTimeout
 	pinger.Run() // blocks until finished
 	stats := pinger.Statistics()
-	fmt.Print(stats.PacketsRecv)
+
 	// get send/receive/rtt stats
 	return stats.PacketsRecv > 0
 }
 
-func (input *SnmpInput) Scanner(target string, response chan Response, info chan string) error {
+func (input *SnmpInput) Scanner(target string, response chan Response, info chan string) {
 	resp := new(Response)
 	resp.Value = make(map[string]string)
 	var m sync.Mutex
-	input.Config.Target = target
+
 	resp.IP = target
 
-	if *input.Verbose {
-		info <- fmt.Sprintf("SNMP Version: %v", *input.Method)
+	if input.Verbose {
+		info <- fmt.Sprintf("SNMP Version: %v", input.Method)
 	}
-	err := input.Config.Connect()
+	input.Config.Target = target
+
+	//added this code to duplicate the snmp object as the first one would finish and close the connection for the rest.
+	//Using this config creates a new connection for each. I don't think it's possible to reuse the same object.
+	tempConfig := input.Config
+
+	err := tempConfig.Connect()
 	if err != nil {
-		m.Lock()
-		defer m.Unlock()
-		return fmt.Errorf("snmp failed: error connecting %v", err.Error())
+		info <- fmt.Sprintf("snmp failed: error connecting %v", err.Error())
+		return
 	}
-	input.FinishConfig()
-	if *input.Verbose {
+	defer tempConfig.Conn.Close()
+	if input.Verbose {
 		info <- fmt.Sprintf("connected to: %v", target)
 	}
-	defer input.Config.Conn.Close()
-	if *input.Method == "Walk" {
+	if input.Method == Walk {
 		//basically says to change default if not specified. This OID is currently the default for a Get request. Probably needs to be done better
 		if input.Oid == defaultOID {
 			input.Oid = defaultWalkOID
 		}
-		if *input.Verbose {
+		if input.Verbose {
 			info <- fmt.Sprintf("Walking devices from: %v", input.Oid)
 		}
-		err := input.Config.Walk(input.Oid, func(pdu g.SnmpPDU) error {
-			go func(){
+		err := tempConfig.Walk(input.Oid, func(pdu g.SnmpPDU) error {
+			go func() {
 				value, ok := input.getValue(pdu.Value)
 				if ok {
 					m.Lock()
@@ -200,38 +212,36 @@ func (input *SnmpInput) Scanner(target string, response chan Response, info chan
 			return nil
 		})
 		if err != nil {
-			return fmt.Errorf("error walking device: %v", err.Error())
+			info <- fmt.Sprintf("error walking device: %v", err.Error())
+			return
 		}
-		return nil
 	}
-	if *input.Method == "Get" {
+	if input.Method == Walk {
 		oids := strings.Split(input.Oid, ",")
-		result, err := input.Config.Get(oids)
-		
-		if err != nil {
-			//ignore devices that aren't needed.
-			return nil
-		}
-		for _, variable := range result.Variables {
-			if variable.Value != nil {
-				value, ok := input.getValue(variable.Value)
-				if ok && value != "" {
-					if !*input.Verbose {
-						fmt.Println(value)
-					}
-					resp.Value[input.Oid] = value
-				}
-			}
+		result, err := tempConfig.Get(oids)
 
+		if err != nil {
+			resp.Value[input.Oid] = fmt.Sprintf("snmp failed: %v", err.Error())
+		} else {
+			for _, variable := range result.Variables {
+				if variable.Value != nil {
+					value, ok := input.getValue(variable.Value)
+					if ok && value != "" {
+						if input.Verbose {
+							info <- fmt.Sprintf("value before adding to response: %v", value)
+						}
+						resp.Value[variable.Name] = value
+					}
+				}
+
+			}
 		}
 		response <- *resp
-		return nil
-		
+
 	}
-	return nil
 }
 
-//processes oid return value and tries to convert it to a string. Bool is set to false if we couldn't determine the type.
+// processes oid return value and tries to convert it to a string. Bool is set to false if we couldn't determine the type.
 func (input *SnmpInput) getValue(value any) (string, bool) {
 	switch v := value.(type) {
 	case []byte:
